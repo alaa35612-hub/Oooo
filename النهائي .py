@@ -126,6 +126,9 @@ class _EditorAutorunDefaults:
 AUTORUN_CONTINUOUS_SCAN = True
 AUTORUN_SCAN_INTERVAL = 0.0
 
+MULTI_TF_SCAN_ENABLED = False        # تشغيل/إيقاف الفاحص متعدد الأطر
+MULTI_TF_SCAN_TFS     = ["1m", "5m", "15m", "1h", "4h", "1d"]  # الأطر المطلوبة
+
 EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
     continuous_scan=AUTORUN_CONTINUOUS_SCAN,
     scan_interval=AUTORUN_SCAN_INTERVAL,
@@ -10883,6 +10886,8 @@ class _Config:
     ny_offset: int = -4
     live: bool = False
     csv_map: Dict[str, str] | None = None
+    multi_tf_enabled: bool = MULTI_TF_SCAN_ENABLED
+    multi_tf_tfs: List[str] = field(default_factory=lambda: list(MULTI_TF_SCAN_TFS))
 
 
 class _Engine:
@@ -10890,18 +10895,49 @@ class _Engine:
         self.cfg = cfg
         self.api = _IndicatorAPI.discover()
         self.exchange = None
+        self.multi_tf_enabled = bool(cfg.multi_tf_enabled)
+        self.multi_tf_tfs = []
+        seen_tfs = set()
+        for tf in cfg.multi_tf_tfs:
+            if tf is None:
+                continue
+            normalized = str(tf).strip()
+            if not normalized or normalized in seen_tfs:
+                continue
+            seen_tfs.add(normalized)
+            self.multi_tf_tfs.append(normalized)
+        if not self.multi_tf_tfs:
+            self.multi_tf_tfs = ["1m"]
         if ccxt is not None and (self.cfg.live or not self.cfg.csv_map):
             try:
                 self.exchange = ccxt.binanceusdm({"enableRateLimit": True})
             except Exception:
                 self.exchange = None
 
-    def _candles_for_symbol(self, sym: str) -> List[Dict[str, float]]:
-        if self.cfg.csv_map and sym in self.cfg.csv_map:
-            return _read_csv_series(self.cfg.csv_map[sym])
+    def _csv_path_for(self, sym: str, timeframe: str) -> Optional[str]:
+        if not self.cfg.csv_map:
+            return None
+        direct = self.cfg.csv_map.get(sym)
+        if timeframe:
+            tf_keys = (
+                f"{sym}@{timeframe}",
+                f"{sym}:{timeframe}",
+                f"{sym}|{timeframe}",
+                f"{sym}.{timeframe}",
+                f"{sym}-{timeframe}",
+            )
+            for key in tf_keys:
+                if key in self.cfg.csv_map:
+                    return self.cfg.csv_map[key]
+        return direct
+
+    def _candles_for_symbol(self, sym: str, timeframe: str = "1m") -> List[Dict[str, float]]:
+        csv_path = self._csv_path_for(sym, timeframe)
+        if csv_path:
+            return _read_csv_series(csv_path)
         if self.exchange is None:
             raise RuntimeError("الوضع المختار يتطلب ccxt أو CSV. وفّر CSV عبر --csv SYMBOL=path.csv")
-        return _fetch_ohlcv_ccxt(self.exchange, sym, "1m",
+        return _fetch_ohlcv_ccxt(self.exchange, sym, timeframe,
                                  since_ms=int(self.cfg.start.timestamp()*1000),
                                  until_ms=int(self.cfg.end.timestamp()*1000))
 
@@ -10920,12 +10956,23 @@ class _Engine:
             eng.evaluate_and_print(self.cfg.strategy)
 
     def run_backtest(self) -> None:
+        if not self.multi_tf_enabled:
+            for sym in self.cfg.symbols:
+                candles = self._candles_for_symbol(sym)
+                if not candles:
+                    print(f"[!] لا توجد شموع لرمز {sym}")
+                    continue
+                self._run_series(sym, candles)
+            return
+
         for sym in self.cfg.symbols:
-            candles = self._candles_for_symbol(sym)
-            if not candles:
-                print(f"[!] لا توجد شموع لرمز {sym}")
-                continue
-            self._run_series(sym, candles)
+            for tf in self.multi_tf_tfs:
+                candles = self._candles_for_symbol(sym, tf)
+                if not candles:
+                    print(f"[!] لا توجد شموع لرمز {sym} على إطار {tf}")
+                    continue
+                print(f"=== {sym} | TF: {tf} | {len(candles)} شموع ===")
+                self._run_series(sym, candles)
 
     def run_live(self) -> None:
         if self.exchange is None:
@@ -10933,11 +10980,32 @@ class _Engine:
         while True:
             now = dt.datetime.utcnow()
             start = now - dt.timedelta(hours=24)
-            for sym in self.cfg.symbols:
-                candles = _fetch_ohlcv_ccxt(self.exchange, sym, "1m",
-                                            since_ms=int(start.timestamp()*1000),
-                                            until_ms=int(now.timestamp()*1000))
-                self._run_series(sym, candles[-600:])  # آخر ~10 ساعات
+            if not self.multi_tf_enabled:
+                for sym in self.cfg.symbols:
+                    candles = _fetch_ohlcv_ccxt(
+                        self.exchange,
+                        sym,
+                        "1m",
+                        since_ms=int(start.timestamp()*1000),
+                        until_ms=int(now.timestamp()*1000),
+                    )
+                    self._run_series(sym, candles[-600:])  # آخر ~10 ساعات
+            else:
+                for sym in self.cfg.symbols:
+                    for tf in self.multi_tf_tfs:
+                        candles = _fetch_ohlcv_ccxt(
+                            self.exchange,
+                            sym,
+                            tf,
+                            since_ms=int(start.timestamp()*1000),
+                            until_ms=int(now.timestamp()*1000),
+                        )
+                        if not candles:
+                            print(f"[!] لا توجد شموع لرمز {sym} على إطار {tf}")
+                            continue
+                        window = candles[-600:]
+                        print(f"=== {sym} | TF: {tf} | {len(window)} شموع ===")
+                        self._run_series(sym, window)  # آخر ~10 ساعات
             time.sleep(10)
 
 
@@ -10967,6 +11035,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     p.add_argument("--ny-offset", type=int, default=DEFAULT_NY_OFFSET, help="إزاحة نيويورك عن UTC (تقريبية)")
     p.add_argument("--live", action="store_true", default=DEFAULT_LIVE, help="مسح حي (يتطلب ccxt)")
     p.add_argument("--csv", default=DEFAULT_CSV, help="خرائط CSV: SYMBOL=path.csv[,SYMBOL2=path2.csv]")
+    p.add_argument("--multi-tf", choices=("on", "off"), default=None,
+                   help="تفعيل/تعطيل الفاحص متعدد الأطر (on/off)")
+    p.add_argument("--tfs", default=None,
+                   help="قائمة أطر زمنية مفصولة بفواصل للفاحص متعدد الأطر")
     args, _ = p.parse_known_args(argv)
     return args
 
@@ -10976,6 +11048,13 @@ def _main(argv: Optional[List[str]] = None) -> None:
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     start = dt.datetime.strptime(args.start, "%Y-%m-%d")
     end = dt.datetime.strptime(args.end, "%Y-%m-%d") + dt.timedelta(days=1) - dt.timedelta(milliseconds=1)
+    multi_tf_enabled = MULTI_TF_SCAN_ENABLED
+    if args.multi_tf is not None:
+        multi_tf_enabled = args.multi_tf.lower() == "on"
+    multi_tf_tfs = list(MULTI_TF_SCAN_TFS)
+    if args.tfs:
+        multi_tf_tfs = [tf.strip() for tf in args.tfs.split(",") if tf.strip()]
+
     cfg = _Config(
         strategy=args.strategy,
         symbols=symbols,
@@ -10986,6 +11065,8 @@ def _main(argv: Optional[List[str]] = None) -> None:
         ny_offset=int(args.ny_offset),
         live=bool(args.live),
         csv_map=_parse_csv_map(args.csv),
+        multi_tf_enabled=multi_tf_enabled,
+        multi_tf_tfs=multi_tf_tfs,
     )
     eng = _Engine(cfg)
     if cfg.live:
