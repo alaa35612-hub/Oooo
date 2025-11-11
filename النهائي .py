@@ -37,7 +37,7 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 try:
     import ccxt  # type: ignore
@@ -128,6 +128,67 @@ AUTORUN_SCAN_INTERVAL = 0.0
 
 MULTI_TF_SCAN_ENABLED = False        # تشغيل/إيقاف الفاحص متعدد الأطر
 MULTI_TF_SCAN_TFS     = ["1m", "5m", "15m", "1h", "4h", "1d"]  # الأطر المطلوبة
+
+# إعدادات تيليجرام — عدّل المتغيرات التالية أو استخدم متغيرات البيئة ذاتها.
+# في حال ترك القيم فارغة لن يتم إرسال أي رسائل.
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_ALERTS_ENABLED = bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
+
+
+def send_telegram_message(text: str, *, disable_notification: bool = False) -> None:
+    """إرسال رسالة نصية إلى بوت تيليجرام إن كانت الإعدادات متوفرة."""
+
+    if not TELEGRAM_ALERTS_ENABLED or not text or requests is None:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "disable_web_page_preview": True,
+        "disable_notification": disable_notification,
+    }
+    try:
+        requests.post(url, json=payload, timeout=8)
+    except Exception as exc:
+        print(f"[Telegram] فشل الإرسال: {exc}", file=sys.stderr)
+
+
+def _resolve_multi_timeframes(
+    primary: str,
+    additional: Optional[Iterable[str]],
+    enabled: bool,
+) -> List[str]:
+    """تحويل إعداد تعدد الأطر إلى قائمة أطر فريدة مرتبة."""
+
+    frames: List[str] = []
+    seen: Set[str] = set()
+
+    def add_candidate(candidate: Optional[str]) -> None:
+        if candidate is None:
+            return
+        value = str(candidate).strip()
+        if not value:
+            return
+        if value not in seen:
+            seen.add(value)
+            frames.append(value)
+
+    if enabled:
+        for tf in additional or []:
+            add_candidate(tf)
+    add_candidate(primary)
+
+    if not frames:
+        for tf in additional or []:
+            add_candidate(tf)
+            if frames:
+                break
+
+    if not frames:
+        frames.append("1m")
+
+    return frames
 
 EDITOR_AUTORUN_DEFAULTS = _EditorAutorunDefaults(
     continuous_scan=AUTORUN_CONTINUOUS_SCAN,
@@ -1325,6 +1386,9 @@ class SmartMoneyAlgoProE5:
         self.series = SeriesAccessor()
         self.base_tf_seconds: Optional[int] = _parse_timeframe_to_seconds(base_timeframe, None)
         self.base_timeframe = base_timeframe or ""
+        self._context_symbol: str = ""
+        self._context_timeframe: str = self.base_timeframe
+        self._telegram_sent_alerts: Set[Tuple[int, str, str, str]] = set()
         self.security_series: Dict[str, SecuritySeries] = {}
         self.ob_volume_history: Dict[str, PineArray] = {}
         self.ob_valid_history: Dict[str, bool] = {}
@@ -1436,6 +1500,74 @@ class SmartMoneyAlgoProE5:
         self._register_box_event(box, status="archived")
         self._trace("box.archive", "archive", timestamp=box.right, text=hist_text)
 
+    def _format_alert_template(
+        self,
+        template: str,
+        symbol: str,
+        close_price: Optional[float],
+        timeframe: str,
+        timestamp: Optional[int],
+    ) -> str:
+        if not template:
+            return ""
+        formatted = template
+        replacements = {
+            "{{ticker}}": symbol or "{{ticker}}",
+            "{{symbol}}": symbol or "{{symbol}}",
+            "{{timeframe}}": timeframe or "{{timeframe}}",
+            "{{interval}}": timeframe or "{{interval}}",
+        }
+        if close_price is not None:
+            replacements["{{close}}"] = format_price(close_price)
+        if timestamp is not None:
+            ts_display = format_timestamp(timestamp)
+            replacements["{{time}}"] = ts_display
+            replacements["{{timestamp}}"] = ts_display
+        for placeholder, value in replacements.items():
+            formatted = formatted.replace(placeholder, value)
+        return formatted
+
+    def _send_telegram_alert(
+        self,
+        title: str,
+        message: Optional[str],
+        timestamp: Optional[int],
+    ) -> None:
+        if not TELEGRAM_ALERTS_ENABLED:
+            return
+
+        symbol = getattr(self, "_context_symbol", "")
+        timeframe = getattr(self, "_context_timeframe", self.base_timeframe or "")
+
+        close_price: Optional[float]
+        try:
+            close_price = float(self.series.get("close", 0))
+            if math.isnan(close_price):
+                close_price = None
+        except Exception:
+            close_price = None
+
+        ts_value = int(timestamp) if isinstance(timestamp, (int, float)) else None
+
+        lines = [f"🔔 {title}"]
+        if symbol:
+            lines.append(f"Symbol: {symbol}")
+        if timeframe:
+            lines.append(f"Timeframe: {timeframe}")
+        if ts_value is not None:
+            lines.append(f"Time: {format_timestamp(ts_value)}")
+        if close_price is not None:
+            lines.append(f"Close: {format_price(close_price)}")
+
+        if message:
+            formatted_message = self._format_alert_template(
+                str(message), symbol, close_price, timeframe, ts_value
+            )
+            if formatted_message:
+                lines.append(formatted_message)
+
+        send_telegram_message("\n".join(lines))
+
     def alertcondition(self, condition: bool, title: str, message: Optional[str] = None) -> None:
         if condition:
             timestamp = self.series.get_time(0)
@@ -1448,6 +1580,16 @@ class SmartMoneyAlgoProE5:
                 title=title,
                 alert_message=message,
             )
+            key = (
+                int(timestamp) if isinstance(timestamp, (int, float)) else 0,
+                title,
+                message or "",
+                getattr(self, "_context_timeframe", self.base_timeframe or ""),
+            )
+            sent = getattr(self, "_telegram_sent_alerts", None)
+            if isinstance(sent, set) and key not in sent:
+                sent.add(key)
+                self._send_telegram_alert(title, message, timestamp)
 
     def _eval_condition(
         self,
@@ -8575,6 +8717,8 @@ def run_runtime_from_file(
     if bars > 0:
         candles = candles[-bars:]
     runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe if timeframe else None)
+    if timeframe:
+        runtime._context_timeframe = timeframe
     runtime.process(candles)
     triggers = _detect_new_formations_and_touches(runtime, args.timeframe, cfg.formation_lookback)
     if triggers:
@@ -8777,6 +8921,8 @@ def scan_binance(
     recent_window_bars: Optional[int] = None,
     max_symbols: Optional[int] = None,
     symbol_selector: Optional[BinanceSymbolSelectorConfig] = None,
+    multi_timeframes: Optional[Iterable[str]] = None,
+    multi_tf_enabled: Optional[bool] = None,
 ) -> Tuple[SmartMoneyAlgoProE5, List[Dict[str, Any]]]:
     if ccxt is None:
         raise RuntimeError("ccxt is not available")
@@ -8801,7 +8947,15 @@ def scan_binance(
         else:
             window = 2
     window = max(1, int(window))
-    for idx, symbol in enumerate(all_symbols):
+    tf_enabled = MULTI_TF_SCAN_ENABLED if multi_tf_enabled is None else bool(multi_tf_enabled)
+    tf_list = _resolve_multi_timeframes(
+        timeframe,
+        multi_timeframes if multi_timeframes is not None else MULTI_TF_SCAN_TFS,
+        tf_enabled,
+    )
+    analysis_index = 0
+    total_combos = max(1, len(all_symbols) * max(1, len(tf_list)))
+    for symbol in all_symbols:
         try:
             ticker = exchange.fetch_ticker(symbol)
         except Exception as exc:
@@ -8827,54 +8981,68 @@ def scan_binance(
                     threshold=min_daily_change,
                 )
             continue
-        candles = fetch_ohlcv(exchange, symbol, timeframe, limit)
-        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=timeframe, tracer=tracer)
-        runtime.process(candles)
-        metrics = runtime.gather_console_metrics()
-        latest_events = metrics.get("latest_events") or {}
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest_events, bars=window
-        )
-        if not recent_hits:
-            print(
-                f"تخطي {_format_symbol(symbol)} لعدم وجود أحداث خلال آخر {window} شموع",
-                flush=True,
+        for tf in tf_list:
+            try:
+                candles = fetch_ohlcv(exchange, symbol, tf, limit)
+            except Exception as exc:
+                print(
+                    f"تخطي {_format_symbol(symbol)} على إطار {tf} بسبب فشل fetch_ohlcv: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                analysis_index += 1
+                continue
+            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=tf, tracer=tracer)
+            runtime._context_symbol = symbol
+            runtime._context_timeframe = tf
+            runtime.process(candles)
+            metrics = runtime.gather_console_metrics()
+            latest_events = metrics.get("latest_events") or {}
+            recent_hits, recent_times = _collect_recent_event_hits(
+                runtime.series, latest_events, bars=window
             )
+            if not recent_hits:
+                print(
+                    f"تخطي {_format_symbol(symbol)} ({analysis_index + 1}/{total_combos}) على إطار {tf} لعدم وجود أحداث خلال آخر {window} شموع",
+                    flush=True,
+                )
+                if tracer and tracer.enabled:
+                    tracer.log(
+                        "scan",
+                        "symbol_skipped_stale_events",
+                        timestamp=runtime.series.get_time(0) or None,
+                        symbol=symbol,
+                        timeframe=tf,
+                        reference_times=recent_times,
+                        window=window,
+                    )
+                analysis_index += 1
+                continue
+
+            metrics["daily_change_percent"] = daily_change
+            summaries.append(
+                {
+                    "symbol": symbol,
+                    "timeframe": tf,
+                    "candles": len(candles),
+                    "alerts": metrics.get("alerts", len(runtime.alerts)),
+                    "boxes": metrics.get("boxes", len(runtime.boxes)),
+                    "metrics": metrics,
+                }
+            )
+            print_symbol_summary(analysis_index, symbol, tf, len(candles), metrics)
             if tracer and tracer.enabled:
                 tracer.log(
                     "scan",
-                    "symbol_skipped_stale_events",
-                    timestamp=runtime.series.get_time(0) or None,
+                    "symbol_complete",
+                    timestamp=runtime.series.get_time(0),
                     symbol=symbol,
-                    timeframe=timeframe,
-                    reference_times=recent_times,
-                    window=window,
+                    timeframe=tf,
+                    candles=len(candles),
                 )
-            continue
-
-        metrics["daily_change_percent"] = daily_change
-        summaries.append(
-            {
-                "symbol": symbol,
-                "timeframe": timeframe,
-                "candles": len(candles),
-                "alerts": metrics.get("alerts", len(runtime.alerts)),
-                "boxes": metrics.get("boxes", len(runtime.boxes)),
-                "metrics": metrics,
-            }
-        )
-        print_symbol_summary(idx, symbol, timeframe, len(candles), metrics)
-        if tracer and tracer.enabled:
-            tracer.log(
-                "scan",
-                "symbol_complete",
-                timestamp=runtime.series.get_time(0),
-                symbol=symbol,
-                timeframe=timeframe,
-                candles=len(candles),
-            )
-        if primary_runtime is None:
-            primary_runtime = runtime
+            if primary_runtime is None:
+                primary_runtime = runtime
+            analysis_index += 1
     if primary_runtime is None:
         primary_runtime = SmartMoneyAlgoProE5(inputs=inputs, tracer=tracer)
         primary_runtime.process([])
@@ -9182,13 +9350,17 @@ def _get_secret(name: str) -> Optional[str]:
 def _send_tg(cfg: _CLISettings, lines: List[str]) -> None:
     if not cfg.tg_enable:
         return
+    text = "\n".join(lines)
+    if TELEGRAM_ALERTS_ENABLED:
+        send_telegram_message(text)
+        return
     token = _get_secret("TELEGRAM_BOT_TOKEN")
     chat_id = _get_secret("TELEGRAM_CHAT_ID")
     if not token or not chat_id or requests is None:
         return
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "HTML"}, timeout=8)
+        requests.post(url, data={"chat_id": chat_id, "text": text, "parse_mode": "HTML"}, timeout=8)
     except Exception:
         pass
 
@@ -9616,72 +9788,83 @@ def _print_ar_report(symbol, timeframe, runtime, exchange, recent_alerts):
     ex = _build_exchange(cfg.market)
     alerts_total = 0
     symbols = symbols[:int(cfg.max_scan)]
-    for i, sym in enumerate(symbols, 1):
-        try:
-            candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-            if cfg.drop_last_incomplete and candles:
-                candles = candles[:-1]
-            runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-            runtime._bos_break_source = cfg.bos_confirmation
-            runtime._strict_close_for_break = cfg.strict_close_for_break
-            runtime.process(candles)
-        except Exception as e:
-            if args.debug:
-                print(
-                    f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                    file=sys.stderr,
-                )
-            continue
-
-        metrics = runtime.gather_console_metrics()
-        latest = metrics.get("latest_events", {})
-        recent_hits, recent_times = _collect_recent_event_hits(
-            runtime.series, latest, bars=recent_window
-        )
-        if not recent_hits:
-            print(
-                f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال آخر {recent_window} شموع"
-            )
-            continue
-
-        recent_alerts = list(runtime.alerts)
-        if recent_window > 0 and runtime.series.length() > 0:
-            cutoff_idx = max(0, runtime.series.length() - recent_window)
-            cutoff_time = runtime.series.get_time(cutoff_idx)
-            recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
-
-        summary = []
-        for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
-            if key in latest:
-                evt = latest[key]
-                disp = evt.get("display", "")
-                status_disp = evt.get("status_display")
-                if status_disp:
-                    disp = f"{disp} [{status_disp}]"
-                direction_hint = _resolve_direction(
-                    evt.get("direction"),
-                    evt.get("direction_display"),
-                    evt.get("status"),
-                    evt.get("text"),
-                    disp,
-                )
-                summary.append(
-                    _colorize_directional_text(
-                        disp,
-                        direction=direction_hint,
-                        fallback=None,
+    tf_list = _resolve_multi_timeframes(
+        args.timeframe,
+        MULTI_TF_SCAN_TFS,
+        MULTI_TF_SCAN_ENABLED,
+    )
+    total_combos = max(1, len(symbols) * max(1, len(tf_list)))
+    processed = 0
+    for sym in symbols:
+        for tf in tf_list:
+            processed += 1
+            try:
+                candles = fetch_ohlcv(ex, sym, tf, args.limit)
+                if cfg.drop_last_incomplete and candles:
+                    candles = candles[:-1]
+                runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=tf)
+                runtime._context_symbol = sym
+                runtime._context_timeframe = tf
+                runtime._bos_break_source = cfg.bos_confirmation
+                runtime._strict_close_for_break = cfg.strict_close_for_break
+                runtime.process(candles)
+            except Exception as e:
+                if args.debug:
+                    print(
+                        f"[{processed}/{total_combos}] {_format_symbol(sym)} ({tf}): error {e}",
+                        file=sys.stderr,
                     )
-                )
+                continue
 
-        if recent_alerts or args.verbose:
-            _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-            if summary:
-                print("  •", " | ".join(summary))
-            for ts, title in recent_alerts[-10:]:
-                ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
-                colored_title = _colorize_directional_text(title)
-                print(f"  - {ts_s} :: {colored_title}")
-            alerts_total += len(recent_alerts)
+            metrics = runtime.gather_console_metrics()
+            latest = metrics.get("latest_events", {})
+            recent_hits, recent_times = _collect_recent_event_hits(
+                runtime.series, latest, bars=recent_window
+            )
+            if not recent_hits:
+                print(
+                    f"[{processed}/{total_combos}] تخطي {_format_symbol(sym)} على إطار {tf} لعدم وجود أحداث خلال آخر {recent_window} شموع"
+                )
+                continue
+
+            recent_alerts = list(runtime.alerts)
+            if recent_window > 0 and runtime.series.length() > 0:
+                cutoff_idx = max(0, runtime.series.length() - recent_window)
+                cutoff_time = runtime.series.get_time(cutoff_idx)
+                recent_alerts = [(ts, title) for ts, title in recent_alerts if ts >= cutoff_time]
+
+            summary = []
+            for key in ["BOS","BOS_PLUS","CHOCH","IDM","IDM_OB","EXT_OB","GOLDEN_ZONE"]:
+                if key in latest:
+                    evt = latest[key]
+                    disp = evt.get("display", "")
+                    status_disp = evt.get("status_display")
+                    if status_disp:
+                        disp = f"{disp} [{status_disp}]"
+                    direction_hint = _resolve_direction(
+                        evt.get("direction"),
+                        evt.get("direction_display"),
+                        evt.get("status"),
+                        evt.get("text"),
+                        disp,
+                    )
+                    summary.append(
+                        _colorize_directional_text(
+                            disp,
+                            direction=direction_hint,
+                            fallback=None,
+                        )
+                    )
+
+            if recent_alerts or args.verbose:
+                _print_ar_report(sym, tf, runtime, ex, recent_alerts)
+                if summary:
+                    print("  •", " | ".join(summary))
+                for ts, title in recent_alerts[-10:]:
+                    ts_s = time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(ts/1000))
+                    colored_title = _colorize_directional_text(title)
+                    print(f"  - {ts_s} :: {colored_title}")
+                alerts_total += len(recent_alerts)
 
     if args.verbose:
         print(f"\nDone. Symbols scanned: {len(symbols)}, alerts: {alerts_total}")
@@ -10350,58 +10533,69 @@ def _android_cli_entry() -> int:
                 except Exception:
                     pass
             alerts_total = 0
+            tf_list = _resolve_multi_timeframes(
+                args.timeframe,
+                MULTI_TF_SCAN_TFS,
+                MULTI_TF_SCAN_ENABLED,
+            )
+            total_pairs = max(1, len(symbols) * max(1, len(tf_list)))
+            processed = 0
 
-            for i, sym in enumerate(symbols, 1):
-                try:
-                    candles = fetch_ohlcv(ex, sym, args.timeframe, args.limit)
-                    if cfg.drop_last_incomplete and candles:
-                        candles = candles[:-1]
-                    runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=args.timeframe)
-                    runtime._bos_break_source = cfg.bos_confirmation
-                    runtime._strict_close_for_break = cfg.strict_close_for_break
-                    runtime.process([
-                        {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
-                        for c in candles
-                    ])
-                except Exception as e:
-                    print(
-                        f"[{i}/{len(symbols)}] {_format_symbol(sym)}: error {e}",
-                        file=sys.stderr,
-                    )
-                    continue
-
-                metrics = runtime.gather_console_metrics()
-                latest_events = metrics.get("latest_events") or {}
-                recent_hits, _ = _collect_recent_event_hits(
-                    runtime.series, latest_events, bars=recent_window
-                )
-                if not recent_hits:
-                    if recent_window == 1:
-                        span_phrase = "آخر شمعة واحدة"
-                    elif recent_window == 2:
-                        span_phrase = "آخر شمعتين"
-                    else:
-                        span_phrase = f"آخر {recent_window} شموع"
-                    print(
-                        f"[{i}/{len(symbols)}] تخطي {_format_symbol(sym)} لعدم وجود أحداث خلال {span_phrase}"
-                    )
-                    continue
-
-                recent_alerts = list(getattr(runtime, "alerts", []))
-                if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
+            for sym in symbols:
+                for tf in tf_list:
+                    processed += 1
                     try:
-                        cutoff_idx = max(0, runtime.series.length() - recent_window)
-                        cutoff_time = runtime.series.get_time(cutoff_idx)
-                        if cutoff_time:
-                            recent_alerts = [
-                                (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
-                            ]
-                    except Exception:
-                        pass
+                        candles = fetch_ohlcv(ex, sym, tf, args.limit)
+                        if cfg.drop_last_incomplete and candles:
+                            candles = candles[:-1]
+                        runtime = SmartMoneyAlgoProE5(inputs=inputs, base_timeframe=tf)
+                        runtime._context_symbol = sym
+                        runtime._context_timeframe = tf
+                        runtime._bos_break_source = cfg.bos_confirmation
+                        runtime._strict_close_for_break = cfg.strict_close_for_break
+                        runtime.process([
+                            {"time": c[0], "open": c[1], "high": c[2], "low": c[3], "close": c[4], "volume": c[5] if len(c)>5 else float('nan')}
+                            for c in candles
+                        ])
+                    except Exception as e:
+                        print(
+                            f"[{processed}/{total_pairs}] {_format_symbol(sym)} ({tf}): error {e}",
+                            file=sys.stderr,
+                        )
+                        continue
 
-                if recent_alerts or args.verbose:
-                    _print_ar_report(sym, args.timeframe, runtime, ex, recent_alerts)
-                    alerts_total += len(recent_alerts)
+                    metrics = runtime.gather_console_metrics()
+                    latest_events = metrics.get("latest_events") or {}
+                    recent_hits, _ = _collect_recent_event_hits(
+                        runtime.series, latest_events, bars=recent_window
+                    )
+                    if not recent_hits:
+                        if recent_window == 1:
+                            span_phrase = "آخر شمعة واحدة"
+                        elif recent_window == 2:
+                            span_phrase = "آخر شمعتين"
+                        else:
+                            span_phrase = f"آخر {recent_window} شموع"
+                        print(
+                            f"[{processed}/{total_pairs}] تخطي {_format_symbol(sym)} على إطار {tf} لعدم وجود أحداث خلال {span_phrase}"
+                        )
+                        continue
+
+                    recent_alerts = list(getattr(runtime, "alerts", []))
+                    if recent_window > 0 and hasattr(runtime, "series") and runtime.series.length() > 0:
+                        try:
+                            cutoff_idx = max(0, runtime.series.length() - recent_window)
+                            cutoff_time = runtime.series.get_time(cutoff_idx)
+                            if cutoff_time:
+                                recent_alerts = [
+                                    (ts, title) for ts, title in recent_alerts if ts >= cutoff_time
+                                ]
+                        except Exception:
+                            pass
+
+                    if recent_alerts or args.verbose:
+                        _print_ar_report(sym, tf, runtime, ex, recent_alerts)
+                        alerts_total += len(recent_alerts)
 
             if args.verbose:
                 print(f"\nتم. عدد الرموز: {len(symbols)}  |  عدد التنبيهات: {alerts_total}")
@@ -10695,11 +10889,31 @@ class _StrategyEngine:
         self.risk_pct = risk_pct
         self.ny_offset = ny_offset
 
+    def _send_telegram_signal(self, sig: _Signal, size: float) -> None:
+        if not TELEGRAM_ALERTS_ENABLED:
+            return
+        timeframe = getattr(self.rt, "_context_timeframe", getattr(self.rt, "base_timeframe", "")) or ""
+        lines = [
+            f"📊 إشارة {sig.strategy}",
+            f"الاتجاه: {'شراء' if sig.side == 'BUY' else 'بيع'}",
+            f"الرمز: {self.symbol}",
+        ]
+        if timeframe:
+            lines.append(f"الإطار الزمني: {timeframe}")
+        lines.append(f"سعر الدخول: {_fmt(sig.entry)}")
+        lines.append(f"وقف الخسارة: {_fmt(sig.stop)}")
+        lines.append(f"حجم العقد التقديري: {_fmt(size)}")
+        lines.append(f"الزمن: {format_timestamp(sig.t)}")
+        if sig.reason:
+            lines.append(f"الوصف: {sig.reason}")
+        send_telegram_message("\n".join(lines))
+
     def _print(self, sig: _Signal) -> None:
         size = _pos_size(self.equity, self.risk_pct, sig.entry, sig.stop)
         when = dt.datetime.utcfromtimestamp(sig.t/1000).strftime("%Y-%m-%d %H:%M:%S UTC")
         print(f"[🔔] {self.symbol} — {('شراء' if sig.side=='BUY' else 'بيع')} @ {_fmt(sig.entry)} — "
               f"SL {_fmt(sig.stop)} — الاستراتيجية: {sig.strategy} — الحجم ≈ {_fmt(size)} — {when} — {sig.reason}")
+        self._send_telegram_signal(sig, size)
 
     def evaluate_and_print(self, name: str) -> None:
         sig = self._evaluate(name)
@@ -10941,10 +11155,16 @@ class _Engine:
                                  since_ms=int(self.cfg.start.timestamp()*1000),
                                  until_ms=int(self.cfg.end.timestamp()*1000))
 
-    def _run_series(self, sym: str, candles: List[Dict[str, float]]) -> None:
+    def _run_series(self, sym: str, candles: List[Dict[str, float]], timeframe: Optional[str] = None) -> None:
         rt = self.api.new_runtime()
         try:
             rt.process([])  # تهيئة إن لزم
+        except Exception:
+            pass
+        try:
+            setattr(rt, "_context_symbol", sym)
+            if timeframe:
+                setattr(rt, "_context_timeframe", timeframe)
         except Exception:
             pass
         eng = _StrategyEngine(rt, sym, equity=self.cfg.equity, risk_pct=self.cfg.risk_pct, ny_offset=self.cfg.ny_offset)
@@ -10962,7 +11182,8 @@ class _Engine:
                 if not candles:
                     print(f"[!] لا توجد شموع لرمز {sym}")
                     continue
-                self._run_series(sym, candles)
+                tf_hint = self.multi_tf_tfs[0] if self.multi_tf_tfs else "1m"
+                self._run_series(sym, candles, timeframe=tf_hint)
             return
 
         for sym in self.cfg.symbols:
@@ -10972,7 +11193,7 @@ class _Engine:
                     print(f"[!] لا توجد شموع لرمز {sym} على إطار {tf}")
                     continue
                 print(f"=== {sym} | TF: {tf} | {len(candles)} شموع ===")
-                self._run_series(sym, candles)
+                self._run_series(sym, candles, timeframe=tf)
 
     def run_live(self) -> None:
         if self.exchange is None:
@@ -10989,7 +11210,7 @@ class _Engine:
                         since_ms=int(start.timestamp()*1000),
                         until_ms=int(now.timestamp()*1000),
                     )
-                    self._run_series(sym, candles[-600:])  # آخر ~10 ساعات
+                    self._run_series(sym, candles[-600:], timeframe="1m")  # آخر ~10 ساعات
             else:
                 for sym in self.cfg.symbols:
                     for tf in self.multi_tf_tfs:
@@ -11005,7 +11226,7 @@ class _Engine:
                             continue
                         window = candles[-600:]
                         print(f"=== {sym} | TF: {tf} | {len(window)} شموع ===")
-                        self._run_series(sym, window)  # آخر ~10 ساعات
+                        self._run_series(sym, window, timeframe=tf)  # آخر ~10 ساعات
             time.sleep(10)
 
 
