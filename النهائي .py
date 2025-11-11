@@ -10896,7 +10896,16 @@ class _Engine:
         self.api = _IndicatorAPI.discover()
         self.exchange = None
         self.multi_tf_enabled = bool(cfg.multi_tf_enabled)
-        self.multi_tf_tfs = [tf for tf in cfg.multi_tf_tfs if tf]
+        self.multi_tf_tfs = []
+        seen_tfs = set()
+        for tf in cfg.multi_tf_tfs:
+            if tf is None:
+                continue
+            normalized = str(tf).strip()
+            if not normalized or normalized in seen_tfs:
+                continue
+            seen_tfs.add(normalized)
+            self.multi_tf_tfs.append(normalized)
         if not self.multi_tf_tfs:
             self.multi_tf_tfs = ["1m"]
         if ccxt is not None and (self.cfg.live or not self.cfg.csv_map):
@@ -10905,9 +10914,27 @@ class _Engine:
             except Exception:
                 self.exchange = None
 
+    def _csv_path_for(self, sym: str, timeframe: str) -> Optional[str]:
+        if not self.cfg.csv_map:
+            return None
+        direct = self.cfg.csv_map.get(sym)
+        if timeframe:
+            tf_keys = (
+                f"{sym}@{timeframe}",
+                f"{sym}:{timeframe}",
+                f"{sym}|{timeframe}",
+                f"{sym}.{timeframe}",
+                f"{sym}-{timeframe}",
+            )
+            for key in tf_keys:
+                if key in self.cfg.csv_map:
+                    return self.cfg.csv_map[key]
+        return direct
+
     def _candles_for_symbol(self, sym: str, timeframe: str = "1m") -> List[Dict[str, float]]:
-        if self.cfg.csv_map and sym in self.cfg.csv_map:
-            return _read_csv_series(self.cfg.csv_map[sym])
+        csv_path = self._csv_path_for(sym, timeframe)
+        if csv_path:
+            return _read_csv_series(csv_path)
         if self.exchange is None:
             raise RuntimeError("الوضع المختار يتطلب ccxt أو CSV. وفّر CSV عبر --csv SYMBOL=path.csv")
         return _fetch_ohlcv_ccxt(self.exchange, sym, timeframe,
